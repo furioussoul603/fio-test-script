@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+# run_fio_suite_select_pool_txt.sh
+# Interactively select a ZFS pool, ensure a dataset/zvol exists (or create it),
+# then run an FIO suite twice: ARC ON and ARC OFF. Each run saves human-readable
+# TXT output files (no JSON). Designed for Proxmox/Ubuntu with ZFS on Linux.
+#
+# Usage:
+#   chmod +x ./run_fio_suite_select_pool_txt.sh
+#   sudo ./run_fio_suite_select_pool_txt.sh
+#
+# Notes:
+# - Writes results in the current directory unless RESULT_DIR is set.
+# - Creates a ZVOL (/dev/zvol/POOL/DATASET/ZVOL) to test against.
+# - Restores original ARC setting when done.
+
+set -euo pipefail
+
+# --------------------- Tunables ---------------------
+DURATION=${DURATION:-60}
+IODEPTH=${IODEPTH:-64}
+NUMJOBS=${NUMJOBS:-8}
+
+# Default dataset/zvol parameters if we need to create them
+DEF_DATASET="${DEF_DATASET:-dbstore}"
+DEF_ZVOL="${DEF_ZVOL:-test4k}"
+DEF_SIZE="${DEF_SIZE:-64G}"        # size of the benchmarking zvol
+DEF_VOLBLOCK="${DEF_VOLBLOCK:-4K}"  # typical for 4K/128K tests
+
+# Set recommended props on create (compression=off, logbias=throughput, primarycache=all)
+SET_PROPS_ON_CREATE=${SET_PROPS_ON_CREATE:-1}
+
+# Auto-destroy the test zvol at the end (0 = keep, 1 = destroy)
+CLEANUP_ZVOL_DEFAULT=${CLEANUP_ZVOL_DEFAULT:-0}
+
+# Where to save results
+RESULT_DIR="${RESULT_DIR:-./fio_txt_results}"
+# ----------------------------------------------------
+
+say() { printf "%s\n" "$*"; }
+need() { command -v "$1" >/dev/null 2>&1 || { say "Missing command: $1"; exit 1; }; }
+for c in zpool zfs fio awk sed grep readlink basename dirname; do need "$c"; done
+
+# Require root because we'll toggle ARC and create zvols
+if [[ $EUID -ne 0 ]]; then
+  say "Please run as root (sudo)."
+  exit 1
+fi
+
+mkdir -p "$RESULT_DIR"
+
+# --------- ARC handling ----------
+ARC_PARAM="/sys/module/zfs/parameters/zfs_arc_max"
+if [[ ! -e "$ARC_PARAM" ]]; then
+  say "ERROR: $ARC_PARAM not found (is ZFS loaded?)"
+  exit 1
+fi
+ARC_ORIG=$(cat "$ARC_PARAM" || echo 0)
+# Choose a low ARC size to simulate ARC OFF (e.g., 64 MiB)
+ARC_LOW=$((64 * 1024 * 1024))
+
+restore_arc() {
+  if [[ -w "$ARC_PARAM" ]]; then
+    echo "$ARC_ORIG" > "$ARC_PARAM" || true
+  fi
+}
+
+trap 'restore_arc' EXIT
+
+set_arc_low() {
+  if [[ -w "$ARC_PARAM" ]]; then
+    echo "$ARC_LOW" > "$ARC_PARAM"
+  else
+    say "WARN: Cannot write $ARC_PARAM to lower ARC."
+  fi
+}
+
+set_arc_orig() {
+  if [[ -w "$ARC_PARAM" ]]; then
+    echo "$ARC_ORIG" > "$ARC_PARAM"
+  else
+    say "WARN: Cannot restore $ARC_PARAM."
+  fi
+}
+
+# --------- Pool selection ----------
+say "Available ZFS pools:"
+mapfile -t POOLS < <(zpool list -H -o name | awk 'NF')
+if [[ ${#POOLS[@]} -eq 0 ]]; then
+  say "No pools found. Exiting."
+  exit 1
+fi
+for i in "${!POOLS[@]}"; do
+  printf "  [%d] %s\n" "$((i+1))" "${POOLS[$i]}"
+done
+
+read -rp "Select a pool by number: " POOL_IDX
+if ! [[ "$POOL_IDX" =~ ^[0-9]+$ ]] || (( POOL_IDX < 1 || POOL_IDX > ${#POOLS[@]} )); then
+  say "Invalid selection."
+  exit 1
+fi
+POOL="${POOLS[$((POOL_IDX-1))]}"
+say "Selected pool: $POOL"
+
+# --------- Dataset/ZVOL setup ----------
+read -rp "Dataset name under $POOL [${DEF_DATASET}]: " DATASET
+DATASET=${DATASET:-$DEF_DATASET}
+
+read -rp "ZVOL name under $POOL/$DATASET [${DEF_ZVOL}]: " ZVOL_NAME
+ZVOL_NAME=${ZVOL_NAME:-$DEF_ZVOL}
+
+ZVOL_PATH="/dev/zvol/${POOL}/${DATASET}/${ZVOL_NAME}"
+
+if ! zfs list -H -o name "${POOL}/${DATASET}" >/dev/null 2>&1; then
+  say "Dataset ${POOL}/${DATASET} does not exist. Creating..."
+  zfs create "${POOL}/${DATASET}"
+fi
+
+if ! zfs list -H -o name "${POOL}/${DATASET}/${ZVOL_NAME}" >/dev/null 2>&1; then
+  say "ZVOL ${POOL}/${DATASET}/${ZVOL_NAME} does not exist."
+  read -rp "Create it with size=${DEF_SIZE} volblocksize=${DEF_VOLBLOCK}? [y/N]: " CREATE_YN
+  CREATE_YN=${CREATE_YN:-N}
+  if [[ "$CREATE_YN" =~ ^[Yy]$ ]]; then
+    zfs create -V "$DEF_SIZE" -b "$DEF_VOLBLOCK" "${POOL}/${DATASET}/${ZVOL_NAME}"
+    if [[ "$SET_PROPS_ON_CREATE" -eq 1 ]]; then
+      zfs set compression=off "${POOL}/${DATASET}/${ZVOL_NAME}" || true
+      zfs set logbias=throughput "${POOL}/${DATASET}/${ZVOL_NAME}" || true
+      zfs set primarycache=all "${POOL}/${DATASET}/${ZVOL_NAME}" || true
+    fi
+  else
+    say "ZVOL required for testing. Exiting."
+    exit 1
+  fi
+else
+  # Ensure it is a volume, not a filesystem
+  TYPE=$(zfs get -H -o value type "${POOL}/${DATASET}/${ZVOL_NAME}")
+  if [[ "$TYPE" != "volume" ]]; then
+    say "ERROR: ${POOL}/${DATASET}/${ZVOL_NAME} exists but is not a ZVOL."
+    exit 1
+  fi
+fi
+
+if [[ ! -e "$ZVOL_PATH" ]]; then
+  # Sometimes udev needs a moment
+  udevadm settle || true
+fi
+if [[ ! -e "$ZVOL_PATH" ]]; then
+  say "ERROR: $ZVOL_PATH not found."
+  exit 1
+fi
+say "Testing target: $ZVOL_PATH"
+
+# --------- FIO run helper (TXT outputs) ----------
+TS=$(date +"%Y%m%d-%H%M%S")
+
+run_one() {
+  local name="$1" ; shift
+  local arc_tag="$1" ; shift
+  local outfile="${RESULT_DIR}/${TS}_${POOL}_${DATASET}_${ZVOL_NAME}_${name}_${arc_tag}.txt"
+
+  fio --name="$name" \
+      --filename="$ZVOL_PATH" \
+      "$@" \
+      --ioengine=libaio \
+      --iodepth="$IODEPTH" \
+      --numjobs="$NUMJOBS" \
+      --runtime="$DURATION" \
+      --time_based \
+      --group_reporting \
+      > "$outfile"
+
+  say "Saved: $outfile"
+}
+
+# --------- Confirm parameters ----------
+say ""
+say "Parameters:"
+say "  DURATION = $DURATION"
+say "  IODEPTH  = $IODEPTH"
+say "  NUMJOBS  = $NUMJOBS"
+say "  POOL/DATASET/ZVOL = ${POOL}/${DATASET}/${ZVOL_NAME}"
+say "  RESULT_DIR = $RESULT_DIR"
+say ""
+
+read -rp "Proceed with FIO suite (ARC ON then ARC OFF)? [y/N]: " GO
+GO=${GO:-N}
+if [[ ! "$GO" =~ ^[Yy]$ ]]; then
+  say "Aborted."
+  exit 0
+fi
+
+# --------- ARC ON pass ----------
+say ""
+say "=== ARC ON pass ==="
+set_arc_orig
+sleep 2
+
+# 4K random read
+run_one "randread_4k" "arc_on" \
+  --rw=randread --bs=4k
+
+# 4K random write
+run_one "randwrite_4k" "arc_on" \
+  --rw=randwrite --bs=4k
+
+# 4K random 70/30 read/write
+run_one "randrw_70r30w_4k" "arc_on" \
+  --rw=randrw --rwmixread=70 --bs=4k
+
+# 128K sequential read
+run_one "read_128k" "arc_on" \
+  --rw=read --bs=128k
+
+# 128K sequential write
+run_one "write_128k" "arc_on" \
+  --rw=write --bs=128k
+
+# --------- ARC OFF (low) pass ----------
+say ""
+say "=== ARC OFF (low) pass ==="
+set_arc_low
+sleep 2
+
+# 4K random read
+run_one "randread_4k" "arc_off" \
+  --rw=randread --bs=4k
+
+# 4K random write
+run_one "randwrite_4k" "arc_off" \
+  --rw=randwrite --bs=4k
+
+# 4K random 70/30 read/write
+run_one "randrw_70r30w_4k" "arc_off" \
+  --rw=randrw --rwmixread=70 --bs=4k
+
+# 128K sequential read
+run_one "read_128k" "arc_off" \
+  --rw=read --bs=128k
+
+# 128K sequential write
+run_one "write_128k" "arc_off" \
+  --rw=write --bs=128k
+
+# --------- Wrap up ----------
+say ""
+say "Restoring ARC to original value and finishing..."
+set_arc_orig
+
+read -rp "Destroy test ZVOL ${POOL}/${DATASET}/${ZVOL_NAME}? [y/N] (auto=${CLEANUP_ZVOL_DEFAULT}) " DESTROY_YN
+DESTROY_YN=${DESTROY_YN:-$CLEANUP_ZVOL_DEFAULT}
+if [[ "$DESTROY_YN" == "1" || "$DESTROY_YN" =~ ^[Yy]$ ]]; then
+  zfs destroy -r "${POOL}/${DATASET}/${ZVOL_NAME}" || true
+  say "Destroyed ${POOL}/${DATASET}/${ZVOL_NAME}."
+else
+  say "Kept ${POOL}/${DATASET}/${ZVOL_NAME}."
+fi
+
+say ""
+say "All done. Results are in: $RESULT_DIR"
